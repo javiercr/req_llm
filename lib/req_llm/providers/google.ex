@@ -265,11 +265,7 @@ defmodule ReqLLM.Providers.Google do
     {system_instruction, contents} =
       case request.options[:context] do
         %ReqLLM.Context{} = ctx ->
-          model_name = request.options[:model]
-          # Convert OpenAI-style context to Gemini format
-          encoded = ReqLLM.Provider.Defaults.encode_context_to_openai_format(ctx, model_name)
-          messages = encoded[:messages] || encoded["messages"] || []
-          split_messages_for_gemini(messages)
+          split_messages_for_gemini(ctx.messages)
 
         _ ->
           split_messages_for_gemini(request.options[:messages] || [])
@@ -516,6 +512,8 @@ defmodule ReqLLM.Providers.Google do
           "user" -> "user"
           :assistant -> "model"
           "assistant" -> "model"
+          :tool -> "user"
+          "tool" -> "user"
           :system -> "user"
           "system" -> "user"
           other when is_binary(other) -> other
@@ -534,9 +532,11 @@ defmodule ReqLLM.Providers.Google do
         case raw_content do
           content when is_binary(content) -> [%{text: content}]
           parts when is_list(parts) -> Enum.map(parts, &convert_content_part/1)
+          %{} = part_map -> [convert_content_part(part_map)]
+          _ -> []
         end
 
-      %{role: role, parts: parts}
+      %{role: role, parts: add_tool_call_parts(parts, message)}
     end)
   end
 
@@ -567,26 +567,204 @@ defmodule ReqLLM.Providers.Google do
     end)
   end
 
+  # Pattern match ReqLLM struct first for optimal performance
+  defp convert_content_part(%ReqLLM.Message.ContentPart{type: :tool_call} = part) do
+    build_function_call(part.tool_call_id, part.tool_name, part.input || %{})
+  end
+
+  defp convert_content_part(%ReqLLM.Message.ContentPart{type: :tool_result} = part) do
+    build_function_response(part.tool_call_id, part.tool_name, part.output || %{})
+  end
+
+  # Handle maps with flexible key access pattern
+  defp convert_content_part(%{} = part) do
+    case get_content_type(part) do
+      :tool_call ->
+        id = get_value(part, [:tool_call_id, "tool_call_id", :id, "id"])
+        name = get_value(part, [:tool_name, "tool_name", :name, "name"])
+        input = get_value(part, [:input, "input", :args, "args"]) || %{}
+        build_function_call(id, name, input)
+
+      :function ->
+        function = get_value(part, [:function, "function"]) || %{}
+        id = get_value(part, [:id, "id"])
+        name = get_value(function, [:name, "name"])
+        args = get_value(function, [:arguments, "arguments", :args, "args"])
+        build_function_call(id, name, args)
+
+      :tool_result ->
+        id = get_value(part, [:tool_call_id, "tool_call_id", :id, "id"])
+        name = get_value(part, [:tool_name, "tool_name", :name, "name"])
+        output = get_value(part, [:output, "output", :response, "response"]) || part
+        build_function_response(id, name, output)
+
+      :text ->
+        text = get_value(part, [:text, "text", :content, "content"])
+        %{text: text || ""}
+
+      :file ->
+        data = get_value(part, [:data, "data"])
+        media_type = get_value(part, [:media_type, "media_type"])
+
+        if is_binary(data),
+          do: build_inline_data(data, media_type),
+          else: %{text: Jason.encode!(part)}
+
+      nil ->
+        # Fallback: try to extract text or encode as JSON
+        text = get_value(part, [:text, "text", :content, "content"])
+        if text, do: %{text: text}, else: %{text: Jason.encode!(part)}
+    end
+  end
+
   defp convert_content_part(%{type: :text, content: text}), do: %{text: text}
   defp convert_content_part(%{"type" => "text", "text" => text}), do: %{text: text}
   defp convert_content_part(%{text: text}), do: %{text: text}
   defp convert_content_part(%{"text" => text}), do: %{text: text}
+  # Handle simple text strings
   defp convert_content_part(text) when is_binary(text), do: %{text: text}
 
-  defp convert_content_part(%{type: :file, data: data, media_type: media_type})
-       when is_binary(data) do
-    encoded_data = Base.encode64(data)
+  # Final fallback for any other type
+  defp convert_content_part(part), do: %{text: to_string(part)}
 
+  # Helper to determine content type from flexible map structures
+  defp get_content_type(part) do
+    type = get_value(part, [:type, "type"])
+
+    case type do
+      t when t in [:tool_call, "tool_call"] ->
+        :tool_call
+
+      t when t in [:tool_result, "tool_result"] ->
+        :tool_result
+
+      t when t in [:function, "function"] ->
+        :function
+
+      t when t in [:text, "text"] ->
+        :text
+
+      t when t in [:file, "file"] ->
+        :file
+
+      _ ->
+        # Infer type from available keys
+        cond do
+          has_key?(part, [:function, "function"]) ->
+            :function
+
+          has_key?(part, [:tool_call_id, "tool_call_id"]) and
+              has_key?(part, [:input, "input", :args, "args"]) ->
+            :tool_call
+
+          has_key?(part, [:tool_call_id, "tool_call_id"]) and
+              has_key?(part, [:output, "output", :response, "response"]) ->
+            :tool_result
+
+          has_key?(part, [:text, "text", :content, "content"]) ->
+            :text
+
+          has_key?(part, [:data, "data"]) ->
+            :file
+
+          true ->
+            nil
+        end
+    end
+  end
+
+  # Helper to get value from map with multiple possible keys (atoms and strings)
+  defp get_value(map, keys) when is_list(keys) do
+    Enum.find_value(keys, &Map.get(map, &1))
+  end
+
+  # Helper to check if map has any of the specified keys
+  defp has_key?(map, keys) when is_list(keys) do
+    Enum.any?(keys, &Map.has_key?(map, &1))
+  end
+
+  # Helper functions to build consistent response structures
+  defp build_function_call(id, name, args) do
     %{
-      inline_data: %{
-        mime_type: media_type,
-        data: encoded_data
+      functionCall: %{
+        id: id,
+        name: name,
+        args: normalize_tool_arguments(args)
       }
     }
   end
 
-  # TODO: Add support for images, audio, video when multimodal support is added
-  defp convert_content_part(part), do: %{text: to_string(part)}
+  defp build_function_response(id, name, response) do
+    %{
+      functionResponse: %{
+        id: id,
+        name: name,
+        response: normalize_tool_response(response)
+      }
+    }
+  end
+
+  defp build_inline_data(data, media_type) do
+    %{
+      inline_data: %{
+        mime_type: media_type,
+        data: Base.encode64(data)
+      }
+    }
+  end
+
+  defp add_tool_call_parts(parts, message) do
+    calls =
+      case message do
+        %{tool_calls: value} when is_list(value) -> value
+        %{"tool_calls" => value} when is_list(value) -> value
+        _ -> []
+      end
+
+    case calls do
+      [] -> parts
+      _ -> parts ++ Enum.map(calls, &tool_call_payload_to_part/1)
+    end
+  end
+
+  defp tool_call_payload_to_part(call) do
+    function = get_value(call, [:function, "function"]) || %{}
+    id = get_value(call, [:id, "id"])
+    name = get_value(function, [:name, "name"])
+    args = get_value(function, [:arguments, "arguments", :args, "args"])
+
+    build_function_call(id, name, args)
+  end
+
+  defp normalize_tool_arguments(arguments) when is_binary(arguments) do
+    case Jason.decode(arguments) do
+      {:ok, decoded} -> decoded
+      {:error, _} -> %{"value" => arguments}
+    end
+  end
+
+  defp normalize_tool_arguments(arguments) when is_map(arguments), do: arguments
+
+  defp normalize_tool_arguments(arguments) when is_list(arguments), do: arguments
+
+  defp normalize_tool_arguments(nil), do: %{}
+
+  defp normalize_tool_arguments(arguments), do: %{"value" => arguments}
+
+  defp normalize_tool_response(response) when is_binary(response) do
+    case Jason.decode(response) do
+      {:ok, decoded} -> decoded
+      {:error, _} -> %{"value" => response}
+    end
+  end
+
+  defp normalize_tool_response(response) when is_map(response), do: response
+
+  defp normalize_tool_response(response) when is_list(response), do: %{"output" => response}
+
+  defp normalize_tool_response(nil), do: %{}
+
+  defp normalize_tool_response(response), do: %{"value" => inspect(response)}
 
   @impl ReqLLM.Provider
   def decode_sse_event(event, model) do
